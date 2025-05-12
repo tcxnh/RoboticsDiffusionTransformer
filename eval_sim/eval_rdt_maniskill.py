@@ -8,10 +8,13 @@ from mani_skill.utils import common, gym_utils
 import argparse
 import yaml
 from scripts.maniskill_model import create_model, RoboticDiffusionTransformerModel
+#from scripts.maniskill_model_bin import create_model, RoboticDiffusionTransformerModel
 import torch
 from collections import deque
 from PIL import Image
 import cv2
+import os
+from datetime import datetime
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
@@ -26,6 +29,8 @@ def parse_args(args=None):
     parser.add_argument("--num-procs", type=int, default=1, help="Number of processes to use to help parallelize the trajectory replay process. This uses CPU multiprocessing and only works with the CPU simulation backend at the moment.")
     parser.add_argument("--pretrained_path", type=str, default=None, help="Path to the pretrained model")
     parser.add_argument("--random_seed", type=int, default=0, help="Random seed for the environment.")
+    parser.add_argument("--save-video", action="store_true", help="Whether to save the video of the episode")
+    parser.add_argument("--video-dir", type=str, default="videos", help="Directory to save videos")
     return parser.parse_args()
 
 import random
@@ -88,8 +93,13 @@ MAX_EPISODE_STEPS = 400
 total_episodes = args.num_traj  
 success_count = 0  
 
-base_seed = 20241201
+base_seed = 1204
 import tqdm
+
+# Create video directory if it doesn't exist
+if args.save_video:
+    os.makedirs(args.video_dir, exist_ok=True)
+
 for episode in tqdm.trange(total_episodes):
     obs_window = deque(maxlen=2)
     obs, _ = env.reset(seed = episode + base_seed)
@@ -105,6 +115,13 @@ for episode in tqdm.trange(total_episodes):
 
     success_time = 0
     done = False
+
+    # Initialize video writer if saving video
+    if args.save_video:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        video_path = os.path.join(args.video_dir, f"{env_id}_episode_{episode+1}_{timestamp}.mp4")
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        video_writer = cv2.VideoWriter(video_path, fourcc, 20.0, (img.shape[1], img.shape[0]))
 
     while global_steps < MAX_EPISODE_STEPS and not done:
         image_arrs = []
@@ -124,6 +141,11 @@ for episode in tqdm.trange(total_episodes):
             obs_window.append(img)
             proprio = obs['agent']['qpos'][:, :-1]
             video_frames.append(img)
+            
+            # Save frame to video if enabled
+            if args.save_video:
+                video_writer.write(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+            
             global_steps += 1
             if terminated or truncated:
                 assert "success" in info, sorted(info.keys())
@@ -131,6 +153,12 @@ for episode in tqdm.trange(total_episodes):
                     success_count += 1
                     done = True
                     break 
+    
+    # Release video writer if saving video
+    if args.save_video:
+        video_writer.release()
+        print(f"Video saved to: {video_path}")
+    
     print(f"Trial {episode+1} finished, success: {info['success']}, steps: {global_steps}")
 
 success_rate = success_count / total_episodes * 100
