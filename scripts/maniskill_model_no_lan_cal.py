@@ -1,3 +1,4 @@
+#支持已预先计算的语言嵌入
 import os
 
 import numpy as np
@@ -11,30 +12,21 @@ from models.multimodal_encoder.t5_encoder import T5Embedder
 from models.rdt_runner import RDTRunner
 
 
-
-# The indices that the raw vector should be mapped to in the unified action vector
-AGILEX_STATE_INDICES = [
-    STATE_VEC_IDX_MAPPING[f"left_arm_joint_{i}_pos"] for i in range(6)
-] + [
-    STATE_VEC_IDX_MAPPING["left_gripper_open"]
-] + [
-    STATE_VEC_IDX_MAPPING[f"right_arm_joint_{i}_pos"] for i in range(6)
+MANISKILL_INDICES = [
+    STATE_VEC_IDX_MAPPING[f"right_arm_joint_{i}_pos"] for i in range(7)
 ] + [
     STATE_VEC_IDX_MAPPING[f"right_gripper_open"]
 ]
 
 
-# Create the RDT model
-def create_model(args, **kwargs):
+def create_model(args, pretrained, **kwargs):
     model = RoboticDiffusionTransformerModel(args, **kwargs)
-    pretrained = kwargs.get("pretrained", None)
-    if (
-        pretrained is not None 
-        and os.path.isfile(pretrained)
-    ):
+    if pretrained is not None:
         model.load_pretrained_weights(pretrained)
     return model
 
+
+DATA_STAT = {'state_min': [-0.7463043928146362, -0.0801204964518547, -0.4976441562175751, -2.657780647277832, -0.5742632150650024, 1.8309762477874756, -2.2423808574676514, 0.0], 'state_max': [0.7645499110221863, 1.4967026710510254, 0.4650936424732208, -0.3866899907588959, 0.5505855679512024, 3.2900545597076416, 2.5737812519073486, 0.03999999910593033], 'action_min': [-0.7472005486488342, -0.08631071448326111, -0.4995281398296356, -2.658363103866577, -0.5751323103904724, 1.8290787935256958, -2.245187997817993, -1.0], 'action_max': [0.7654682397842407, 1.4984270334243774, 0.46786263585090637, -0.38181185722351074, 0.5517147779464722, 3.291581630706787, 2.575840711593628, 1.0]}
 
 class RoboticDiffusionTransformerModel(object):
     """A wrapper for the RDT model, which handles
@@ -48,67 +40,90 @@ class RoboticDiffusionTransformerModel(object):
         dtype=torch.bfloat16,
         image_size=None,
         control_frequency=25,
-        pretrained=None,
+        pretrained_text_encoder_name_or_path=None,
         pretrained_vision_encoder_name_or_path=None,
+        lang_embeddings_path=None,  # 新增参数，用于预计算的语言嵌入
     ):
         self.args = args
         self.dtype = dtype
         self.image_size = image_size
         self.device = device
         self.control_frequency = control_frequency
-        # We do not use the text encoder due to limited GPU memory
-        # self.text_tokenizer, self.text_model = self.get_text_encoder(pretrained_text_encoder_name_or_path)
-        self.image_processor, self.vision_model = self.get_vision_encoder(pretrained_vision_encoder_name_or_path)
-        self.policy = self.get_policy(pretrained)
+        self.lang_embeddings_path = lang_embeddings_path  # 保存路径
         
+        # 更改初始化顺序，先检查是否有预计算的嵌入
+        if lang_embeddings_path is not None and os.path.exists(lang_embeddings_path):
+            # 如果有预计算的嵌入，设置为None，后续直接加载嵌入
+            self.text_tokenizer, self.text_model = None, None
+            print(f"Using pre-computed language embeddings from: {lang_embeddings_path}")
+        else:
+            # 否则正常初始化T5模型
+            self.text_tokenizer, self.text_model = self.get_text_encoder(pretrained_text_encoder_name_or_path)
+        
+        self.image_processor, self.vision_model = self.get_vision_encoder(pretrained_vision_encoder_name_or_path)
+        self.policy = self.get_policy()
+
+        self.state_min = torch.tensor(DATA_STAT['state_min']).to(device)
+        self.state_max = torch.tensor(DATA_STAT['state_max']).to(device)
+        self.action_min = torch.tensor(DATA_STAT['action_min']).to(device)
+        self.action_max = torch.tensor(DATA_STAT['action_max']).to(device)
+
         self.reset()
 
-    def get_policy(self, pretrained):
+    def get_policy(self):
         """Initialize the model."""
-        print(f"self.args['common'] 内容{self.args['common']}")
         # Initialize model with arguments
-        if (
-            pretrained is None
-            or os.path.isfile(pretrained)
-        ):
-            img_cond_len = (self.args["common"]["img_history_size"] 
-                            * self.args["common"]["num_cameras"] 
-                            * self.vision_model.num_patches)
-            
-            _model = RDTRunner(
-                action_dim=self.args["common"]["state_dim"],
-                pred_horizon=self.args["common"]["action_chunk_size"],
-                config=self.args["model"],
-                lang_token_dim=self.args["model"]["lang_token_dim"],
-                img_token_dim=self.args["model"]["img_token_dim"],
-                state_token_dim=self.args["model"]["state_token_dim"],
-                max_lang_cond_len=self.args["dataset"]["tokenizer_max_length"],
-                img_cond_len=img_cond_len,
-                img_pos_embed_config=[
-                    # No initial pos embed in the last grid size
-                    # since we've already done in ViT
-                    ("image", (self.args["common"]["img_history_size"], 
-                        self.args["common"]["num_cameras"], 
-                        -self.vision_model.num_patches)),  
-                ],
-                lang_pos_embed_config=[
-                    # Similarly, no initial pos embed for language
-                    ("lang", -self.args["dataset"]["tokenizer_max_length"]),
-                ],
-                dtype=self.dtype,
-            )
-        else:
-            _model = RDTRunner.from_pretrained(pretrained)
+        img_cond_len = (self.args["common"]["img_history_size"] 
+                        * self.args["common"]["num_cameras"] 
+                        * self.vision_model.num_patches)
+        
+        _model = RDTRunner(
+            action_dim=self.args["common"]["state_dim"],
+            pred_horizon=self.args["common"]["action_chunk_size"],
+            config=self.args["model"],
+            lang_token_dim=self.args["model"]["lang_token_dim"],
+            img_token_dim=self.args["model"]["img_token_dim"],
+            state_token_dim=self.args["model"]["state_token_dim"],
+            max_lang_cond_len=self.args["dataset"]["tokenizer_max_length"],
+            img_cond_len=img_cond_len,
+            img_pos_embed_config=[
+                # No initial pos embed in the last grid size
+                # since we've already done in ViT
+                ("image", (self.args["common"]["img_history_size"], 
+                    self.args["common"]["num_cameras"], 
+                    -self.vision_model.num_patches)),  
+            ],
+            lang_pos_embed_config=[
+                # Similarly, no initial pos embed for language
+                ("lang", -self.args["dataset"]["tokenizer_max_length"]),
+            ],
+            dtype=self.dtype,
+        )
 
         return _model
-    
 
     def get_text_encoder(self, pretrained_text_encoder_name_or_path):
-        text_embedder = T5Embedder(from_pretrained=pretrained_text_encoder_name_or_path, 
-                                   model_max_length=self.args["dataset"]["tokenizer_max_length"], 
-                                   device=self.device)
-        tokenizer, text_encoder = text_embedder.tokenizer, text_embedder.model
-        return tokenizer, text_encoder
+        """
+        这里是文本编码器初始化的地方，修改以支持不同的T5模型。
+        如果不需要实际初始化T5，可以选择返回None。
+        """
+        if pretrained_text_encoder_name_or_path is None:
+            # 如果没有指定模型，默认使用支持的模型
+            pretrained_text_encoder_name_or_path = "google/t5-v1_1-xxl"
+        
+        try:
+            # 尝试初始化T5编码器，但不要使用断言检查
+            text_embedder = T5Embedder(
+                from_pretrained=pretrained_text_encoder_name_or_path, 
+                model_max_length=self.args["dataset"]["tokenizer_max_length"], 
+                device=self.device
+            )
+            tokenizer, text_encoder = text_embedder.tokenizer, text_embedder.model
+            return tokenizer, text_encoder
+        except Exception as e:
+            print(f"Warning: Failed to initialize T5 encoder: {e}")
+            print("If you're using pre-computed embeddings, this is expected and can be ignored.")
+            return None, None
 
     def get_vision_encoder(self, pretrained_vision_encoder_name_or_path):
         vision_encoder = SiglipVisionTower(vision_tower=pretrained_vision_encoder_name_or_path, args=None)
@@ -121,11 +136,12 @@ class RoboticDiffusionTransformerModel(object):
         device = self.device
         weight_dtype = self.dtype
         self.policy.eval()
-        # self.text_model.eval()
+        if self.text_model is not None:
+            self.text_model.eval()
+            self.text_model = self.text_model.to(device, dtype=weight_dtype)
         self.vision_model.eval()
 
         self.policy = self.policy.to(device, dtype=weight_dtype)
-        # self.text_model = self.text_model.to(device, dtype=weight_dtype)
         self.vision_model = self.vision_model.to(device, dtype=weight_dtype)
 
     def load_pretrained_weights(self, pretrained=None):
@@ -134,7 +150,7 @@ class RoboticDiffusionTransformerModel(object):
         print(f'Loading weights from {pretrained}')
         filename = os.path.basename(pretrained)
         if filename.endswith('.pt'):
-            checkpoint =  torch.load(pretrained)
+            checkpoint = torch.load(pretrained)
             self.policy.load_state_dict(checkpoint["module"])
         elif filename.endswith('.safetensors'):
             from safetensors.torch import load_model
@@ -144,6 +160,7 @@ class RoboticDiffusionTransformerModel(object):
 
     def encode_instruction(self, instruction, device="cuda"):
         """Encode string instruction to latent embeddings.
+        如果有预计算的嵌入，这个方法可能不会被使用。
 
         Args:
             instruction: a string of instruction
@@ -152,6 +169,18 @@ class RoboticDiffusionTransformerModel(object):
         Returns:
             pred: a tensor of latent embeddings of shape (text_max_length, 512)
         """
+        # 检查是否有预计算的语言嵌入路径
+        if self.lang_embeddings_path is not None and os.path.exists(self.lang_embeddings_path):
+            # 如果有预计算的嵌入，直接加载并返回
+            # 这里假设预计算的嵌入是针对特定指令的，真实情况可能需要根据instruction来获取对应的嵌入
+            print(f"Loading pre-computed embeddings for instruction: '{instruction}'")
+            embeddings = torch.load(self.lang_embeddings_path, map_location=device)
+            return embeddings
+        
+        # 如果没有预计算的嵌入，使用T5模型进行编码
+        if self.text_tokenizer is None or self.text_model is None:
+            raise ValueError("T5 model and tokenizer are not initialized, but no pre-computed embeddings provided!")
+        
         tokens = self.text_tokenizer(
             instruction, return_tensors="pt",
             padding="longest",
@@ -166,72 +195,46 @@ class RoboticDiffusionTransformerModel(object):
 
     def _format_joint_to_state(self, joints):
         """
-        Format the joint proprioception into the unified action vector.
+        Format the robot joint state into the unified state vector.
 
         Args:
-            joints (torch.Tensor): The joint proprioception to be formatted. 
+            joints (torch.Tensor): The joint state to be formatted. 
                 qpos ([B, N, 14]).
 
         Returns:
-            state (torch.Tensor): The formatted vector for RDT ([B, N, 128]). 
+            state (torch.Tensor): The formatted state for RDT ([B, N, 128]). 
         """
-        # Rescale the gripper to the range of [0, 1]
-        joints = joints / torch.tensor(
-            [[[1, 1, 1, 1, 1, 1, 4.7908, 1, 1, 1, 1, 1, 1, 4.7888]]],
-            device=joints.device, dtype=joints.dtype
-        )
-        
+        # normalize to -1,1
+        joints = (joints - self.state_min) / (self.state_max - self.state_min) * 2 - 1
         B, N, _ = joints.shape
         state = torch.zeros(
             (B, N, self.args["model"]["state_token_dim"]), 
             device=joints.device, dtype=joints.dtype
         )
-        # Fill into the unified state vector
-        state[:, :, AGILEX_STATE_INDICES] = joints
-        # Assemble the mask indicating each dimension's availability 
+        # assemble the unifed state vector
+        state[:, :, MANISKILL_INDICES] = joints
         state_elem_mask = torch.zeros(
             (B, self.args["model"]["state_token_dim"]),
             device=joints.device, dtype=joints.dtype
         )
-        state_elem_mask[:, AGILEX_STATE_INDICES] = 1
+        state_elem_mask[:, MANISKILL_INDICES] = 1
         return state, state_elem_mask
 
     def _unformat_action_to_joint(self, action):
-        """
-        Unformat the unified action vector into the joint action to be executed.
-
-        Args:
-            action (torch.Tensor): The unified action vector to be unformatted. 
-                ([B, N, 128])
-        
-        Returns:
-            joints (torch.Tensor): The unformatted robot joint action. 
-                qpos ([B, N, 14]).
-        """
-        action_indices = AGILEX_STATE_INDICES
+        action_indices = MANISKILL_INDICES
         joints = action[:, :, action_indices]
         
-        # Rescale the gripper back to the action range
-        # Note that the action range and proprioception range are different
-        # for Mobile ALOHA robot
-        joints = joints * torch.tensor(
-            [[[1, 1, 1, 1, 1, 1, 11.8997, 1, 1, 1, 1, 1, 1, 13.9231]]],
-            device=joints.device, dtype=joints.dtype
-        )
+        # denormalize to action space 
+        joints = (joints + 1) / 2 * (self.action_max - self.action_min) + self.action_min
         
         return joints
 
     @torch.no_grad()
     def step(self, proprio, images, text_embeds):
         """
-        Predict the next action chunk given the 
-        proprioceptive states, images, and instruction embeddings.
-
         Args:
             proprio: proprioceptive states
-            images: RGB images, the order should be
-                [ext_{t-1}, right_wrist_{t-1}, left_wrist_{t-1}, 
-                ext_{t}, right_wrist_{t}, left_wrist_{t}]
+            images: RGB images
             text_embeds: instruction embeddings
 
         Returns:
@@ -240,7 +243,6 @@ class RoboticDiffusionTransformerModel(object):
         device = self.device
         dtype = self.dtype
         
-        # The background image used for padding
         background_color = np.array([
             int(x*255) for x in self.image_processor.image_mean
         ], dtype=np.uint8).reshape(1, 1, 3)
@@ -249,7 +251,6 @@ class RoboticDiffusionTransformerModel(object):
             self.image_processor.size["width"], 3), dtype=np.uint8
         ) * background_color
         
-        # Preprocess the images by order and encode them
         image_tensor_list = []
         for image in images:
             if image is None:
@@ -287,7 +288,7 @@ class RoboticDiffusionTransformerModel(object):
         image_embeds = self.vision_model(image_tensor).detach()
         image_embeds = image_embeds.reshape(-1, self.vision_model.hidden_size).unsqueeze(0)
 
-        # Prepare the proprioception states and the control frequency
+        # history of actions
         joints = proprio.to(device).unsqueeze(0)   # (1, 1, 14)
         states, state_elem_mask = self._format_joint_to_state(joints)    # (1, 1, 128), (1, 128)
         states, state_elem_mask = states.to(device, dtype=dtype), state_elem_mask.to(device, dtype=dtype)
@@ -296,7 +297,6 @@ class RoboticDiffusionTransformerModel(object):
         
         text_embeds = text_embeds.to(device, dtype=dtype)
         
-        # Predict the next action chunk given the inputs
         trajectory = self.policy.predict_action(
             lang_tokens=text_embeds,
             lang_attn_mask=torch.ones(
